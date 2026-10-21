@@ -25,30 +25,115 @@ function canPlayNatively(info: MediaInfo) {
   return true;
 }
 
+// how far ahead of the playhead the preview stream is read before waiting
+const previewReadAhead = 45;
+
+// Plays a preview stream (fragmented MP4 from ffmpeg, starting at `start`) through Media Source Extensions.
+// Returns a function that stops it.
+function startPreviewStream({ video, info, start, onFatal }: { video: HTMLVideoElement, info: MediaInfo, start: number, onFatal: (msg: string) => void }) {
+  const controller = new AbortController();
+  const mediaSource = new MediaSource();
+  const objectUrl = URL.createObjectURL(mediaSource);
+  video.src = objectUrl;
+  const codecs = [...(info.video != null ? ['avc1.640028'] : []), ...(info.audio != null ? ['mp4a.40.2'] : [])].join(',');
+
+  mediaSource.addEventListener('sourceopen', async () => {
+    URL.revokeObjectURL(objectUrl);
+    let sourceBuffer: SourceBuffer;
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(`video/mp4; codecs="${codecs}"`);
+    } catch (err) {
+      onFatal(`Preview not possible: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const appendChunk = (chunk: Uint8Array) => new Promise<void>((resolve, reject) => {
+      const done = () => {
+        sourceBuffer.removeEventListener('updateend', done);
+        sourceBuffer.removeEventListener('error', fail);
+        resolve();
+      };
+      const fail = () => {
+        sourceBuffer.removeEventListener('updateend', done);
+        sourceBuffer.removeEventListener('error', fail);
+        reject(new Error('Preview stream error'));
+      };
+      sourceBuffer.addEventListener('updateend', done);
+      sourceBuffer.addEventListener('error', fail);
+      sourceBuffer.appendBuffer(chunk as Uint8Array<ArrayBuffer>);
+    });
+    try {
+      const res = await fetch(vc.previewUrl(info.path, start), { signal: controller.signal });
+      if (res.body == null) throw new Error('No preview stream');
+      const reader = res.body.getReader();
+      for (;;) {
+        // don't read too far ahead: ffmpeg then simply waits
+        while (!controller.signal.aborted && sourceBuffer.buffered.length > 0 && sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - video.currentTime > previewReadAhead) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, 400));
+        }
+        // eslint-disable-next-line no-await-in-loop
+        const { done, value } = await reader.read();
+        if (done || controller.signal.aborted) break;
+        // eslint-disable-next-line no-await-in-loop
+        await appendChunk(value);
+        // keep memory in check: drop what is well behind the playhead
+        if (sourceBuffer.buffered.length > 0 && video.currentTime - sourceBuffer.buffered.start(0) > 60) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise<void>((resolve) => {
+            sourceBuffer.addEventListener('updateend', () => resolve(), { once: true });
+            sourceBuffer.remove(0, video.currentTime - 30);
+          });
+        }
+      }
+      if (!controller.signal.aborted && mediaSource.readyState === 'open') mediaSource.endOfStream();
+    } catch (err) {
+      if (!controller.signal.aborted) console.warn('preview stream', err);
+    }
+  }, { once: true });
+
+  return () => controller.abort();
+}
+
 // Plays the open file. Times are seconds from the start of the file.
-export default function Player({ info, volume, onTime, onPlaying, onModeChange, ref }: {
+export default function Player({ info, volume, onTime, onPlaying, ref }: {
   info: MediaInfo,
   volume: number,
   onTime: (time: number) => void,
   onPlaying: (playing: boolean) => void,
-  onModeChange?: (mode: 'native' | 'preview') => void,
   ref: Ref<PlayerHandle>,
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [mode, setMode] = useState<'native' | 'preview'>(() => (canPlayNatively(info) ? 'native' : 'preview'));
+  const [message, setMessage] = useState<string>();
   // in preview mode the stream starts at this file time
-  const [previewStart, setPreviewStart] = useState(0);
   const previewStartRef = useRef(0);
+  const stopPreviewRef = useRef<(() => void) | undefined>(undefined);
   const stopAtRef = useRef<number | undefined>(undefined);
-  const pendingSeekRef = useRef<number | undefined>(undefined);
-  const resumeRef = useRef(false);
   const timeRef = useRef(0);
 
-  useEffect(() => {
-    onModeChange?.(mode);
-  }, [mode, onModeChange]);
+  const restartPreview = useCallback((start: number, resume: boolean) => {
+    const v = videoRef.current;
+    if (v == null) return;
+    stopPreviewRef.current?.();
+    previewStartRef.current = start;
+    stopPreviewRef.current = startPreviewStream({ video: v, info, start, onFatal: setMessage });
+    if (resume) v.play().catch(() => undefined);
+  }, [info]);
 
-  const src = mode === 'native' ? vc.fileUrl(info.path) : vc.previewUrl(info.path, previewStart);
+  // set up the source
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v == null) return undefined;
+    if (mode === 'native') {
+      v.src = vc.fileUrl(info.path);
+    } else {
+      restartPreview(timeRef.current, false);
+    }
+    return () => {
+      stopPreviewRef.current?.();
+      stopPreviewRef.current = undefined;
+    };
+  }, [info.path, mode, restartPreview]);
 
   const fileTime = useCallback(() => {
     const v = videoRef.current;
@@ -68,16 +153,11 @@ export default function Player({ info, volume, onTime, onPlaying, onModeChange, 
     }
     // inside what the current preview stream has already delivered: seek within it, else start a new stream
     const rel = time - previewStartRef.current;
-    const buffered = v.buffered.length > 0 ? v.buffered.end(v.buffered.length - 1) : 0;
-    if (rel >= 0 && rel <= buffered) {
-      v.currentTime = rel;
-    } else {
-      resumeRef.current = !v.paused;
-      previewStartRef.current = time;
-      pendingSeekRef.current = 0;
-      setPreviewStart(time);
-    }
-  }, [info.duration, mode, onTime]);
+    const b = v.buffered;
+    const inBuffer = b.length > 0 && [...Array(b.length).keys()].some((i) => rel >= b.start(i) && rel <= b.end(i));
+    if (rel >= 0 && inBuffer) v.currentTime = rel;
+    else restartPreview(time, !v.paused);
+  }, [info.duration, mode, onTime, restartPreview]);
 
   useImperativeHandle(ref, () => ({
     play: () => { videoRef.current?.play().catch(() => undefined); },
@@ -93,7 +173,7 @@ export default function Player({ info, volume, onTime, onPlaying, onModeChange, 
       seek(from);
       stopAtRef.current = to;
       // start once the seek has landed
-      setTimeout(() => videoRef.current?.play().catch(() => undefined), 150);
+      setTimeout(() => videoRef.current?.play().catch(() => undefined), 200);
     },
   }), [seek]);
 
@@ -121,50 +201,36 @@ export default function Player({ info, volume, onTime, onPlaying, onModeChange, 
     return () => cancelAnimationFrame(raf);
   }, [fileTime, onTime]);
 
-  const onError = useCallback(() => {
-    // the built-in player couldn't open it after all: switch to the preview stream at the same position
-    if (mode === 'native') {
-      resumeRef.current = !(videoRef.current?.paused ?? true);
-      previewStartRef.current = timeRef.current;
-      setPreviewStart(timeRef.current);
-      setMode('preview');
-    }
+  const switchToPreview = useCallback(() => {
+    // the built-in player couldn't open it after all: use the preview stream from the same position
+    if (mode === 'native') setMode('preview');
   }, [mode]);
 
   const onLoadedMetadata = useCallback(() => {
     const v = videoRef.current;
     if (v == null) return;
-    if (mode === 'native' && info.video != null && v.videoWidth === 0) {
-      onError();
-      return;
-    }
-    if (pendingSeekRef.current != null) {
-      v.currentTime = pendingSeekRef.current;
-      pendingSeekRef.current = undefined;
-    } else if (mode === 'native') {
+    if (mode === 'native') {
+      if (info.video != null && v.videoWidth === 0) {
+        switchToPreview();
+        return;
+      }
       v.currentTime = timeRef.current;
     }
-    if (resumeRef.current) {
-      resumeRef.current = false;
-      v.play().catch(() => undefined);
-    }
-  }, [info.video, mode, onError]);
+  }, [info.video, mode, switchToPreview]);
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <video
         ref={videoRef}
-        key={src}
-        src={src}
         style={{ width: '100%', height: '100%', objectFit: 'contain', display: info.video != null ? 'block' : 'none' }}
         preload="auto"
         onLoadedMetadata={onLoadedMetadata}
-        onError={onError}
+        onError={() => { if (mode === 'native') switchToPreview(); }}
         onPlay={() => onPlaying(true)}
         onPause={() => onPlaying(false)}
         onEnded={() => onPlaying(false)}
-        onSeeked={() => onTime(fileTime())}
+        onSeeked={() => { if (videoRef.current?.paused) onTime(fileTime()); }}
         onClick={() => {
           const v = videoRef.current;
           if (v) {
@@ -172,14 +238,13 @@ export default function Player({ info, volume, onTime, onPlaying, onModeChange, 
           }
         }}
       />
-      {info.video == null && (
-        <div style={{ color: '#bbb', fontSize: '1.1em' }}>Audio file</div>
-      )}
+      {info.video == null && <div style={{ color: '#bbb', fontSize: '1.1em' }}>Audio file</div>}
       {mode === 'preview' && (
         <div className="chip" style={{ position: 'absolute', top: 10, left: 10, background: 'rgb(0 0 0 / 50%)', color: '#ddd' }} title="This file's format can't be played directly, so a converted preview is shown. Exports always use the original.">
           Preview
         </div>
       )}
+      {message != null && <div className="chip" style={{ position: 'absolute', bottom: 10, left: 10, background: 'rgb(0 0 0 / 60%)', color: '#fbb' }}>{message}</div>}
     </div>
   );
 }

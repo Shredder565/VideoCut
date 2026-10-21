@@ -50,6 +50,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      autoplayPolicy: 'no-user-gesture-required',
     },
   });
   win.loadFile(join(app.getAppPath(), 'dist', 'renderer', 'index.html'));

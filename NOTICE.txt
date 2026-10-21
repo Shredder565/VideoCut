@@ -1,0 +1,11 @@
+VideoCut
+Copyright (c) 2026 Shredder565. All rights reserved.
+
+VideoCut includes FFmpeg (ffmpeg.exe, ffprobe.exe and its libraries, in the "ffmpeg" folder),
+which is not part of VideoCut's own code. FFmpeg is licensed under the GNU General Public License
+version 3 (this build includes GPL components); see ffmpeg/FFMPEG-LICENSE.txt. The FFmpeg build is
+the "n8.1 win64 gpl shared" build from https://github.com/BtbN/FFmpeg-Builds, and FFmpeg's source
+code is available at https://ffmpeg.org/download.html.
+
+VideoCut is built with Electron (MIT licence), React (MIT licence) and react-icons (MIT licence;
+Feather icons, MIT licence).

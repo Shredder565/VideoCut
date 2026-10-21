@@ -11,7 +11,7 @@ export const previewScheme = 'vcpreview';
 
 export function registerPreviewScheme() {
   protocol.registerSchemesAsPrivileged([
-    { scheme: previewScheme, privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true } },
+    { scheme: previewScheme, privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true, corsEnabled: true } },
   ]);
 }
 
@@ -33,7 +33,7 @@ export function handlePreviewProtocol() {
       '-map', '0:v:0?', '-map', '0:a:0?',
       '-sn', '-dn',
       '-vf', 'scale=-2:\'min(720,ih)\':flags=bilinear,format=yuv420p',
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '22', '-g', '25',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'high', '-level:v', '4.0', '-crf', '22', '-g', '25',
       '-c:a', 'aac', '-ac', '2', '-b:a', '160k',
       '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       'pipe:1',
@@ -41,6 +41,6 @@ export function handlePreviewProtocol() {
 
     const stream = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
     request.signal?.addEventListener('abort', () => child.kill());
-    return new Response(stream, { status: 200, headers: { 'content-type': 'video/mp4' } });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'video/mp4', 'access-control-allow-origin': '*' } });
   });
 }

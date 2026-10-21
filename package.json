@@ -14,7 +14,7 @@
     "start": "electron .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "pack": "npm run build && electron-builder --win dir --x64 --publish never"
+    "pack": "npm run build && electron-builder --win --x64 --publish never"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -31,5 +31,52 @@
     "vite": "7.3.5",
     "vitest": "^4.1.11"
   },
-  "type": "module"
+  "type": "module",
+  "build": {
+    "appId": "io.github.shredder565.videocut",
+    "productName": "VideoCut",
+    "copyright": "Copyright © 2026 Shredder565",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "build/icon.png",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "ffmpeg/win-x64",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "NOTICE.txt",
+        "to": "NOTICE.txt"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "VideoCut-portable-win-x64.exe"
+    },
+    "artifactName": "VideoCut-win-x64.${ext}"
+  }
 }

@@ -5,8 +5,8 @@
 //   re-encoded, see smartRender.ts). The other selected streams (audio, subtitles) are stream copied, starting where the
 //   video's first frame actually is, and muxed with the video. Merged exports go through the joiner (smartJoin.ts).
 // - 'keyframe': fast. Everything is stream copied from the keyframe at or before the clip start, so the output can start a
-//   little early (and an open GOP's leading frames may not decode).
-// Files without a selected video stream are always stream copied; in 'smart' mode with an accurate seek.
+//   little early (the leading frames of an open GOP keyframe, which can't be decoded, are left out).
+// Without a selected video stream, both modes stream copy the clip with an accurate seek (to the audio packet).
 //
 // Output files are never overwritten: an existing name gets " (2)", " (3)", ... appended.
 // Temporary files go next to the outputs and are removed when done, also on failure or cancel.
@@ -210,24 +210,29 @@ function getMuxerArgs(format: string) {
 // Stream copy [from, from + duration) of some streams with an accurate two-step seek: the input seek lands on a keyframe
 // (or packet) before `from`, and the output seek drops the packets before `from`. Output timestamps start at `from`, so a
 // packet that starts a bit after `from` keeps its offset (that is what keeps audio in sync with a video starting at `from`).
-// (When the streams include video, `from` must be a keyframe: the video starts with the first keyframe at or after `from`.)
-function getAccurateCopyArgs({ inputPath, streams, from, duration, format, outPath }: {
+// The output seek compares decode timestamps, and stream copy starts the video with a keyframe: with video, the video
+// starts with the first keyframe whose dts is at or after `from`. `dropVideoBefore` (seconds from `from`) drops the video
+// packets shown before that (leading frames of an open GOP keyframe, which can't be decoded without the previous GOP).
+// `from` null: from the start of the file, keeping everything (also packets with negative timestamps)
+function getAccurateCopyArgs({ inputPath, streams, from, duration, format, outPath, dropVideoBefore }: {
   inputPath: string,
   streams: ProbeStream[],
-  from: number,
+  from: number | null,
   duration: number | undefined,
   format: string,
   outPath: string,
+  dropVideoBefore?: number | undefined,
 }) {
-  const pre = Math.max(0, from - 10);
+  const pre = Math.max(0, (from ?? 0) - 10);
   return [
     '-hide_banner', '-nostdin', '-y',
     ...(pre > 0 ? ['-ss', fmt(pre)] : []),
     '-i', inputPath,
-    '-ss', fmt(from - pre),
+    ...(from != null ? ['-ss', fmt(from - pre)] : []),
     ...(duration != null ? ['-t', fmt(duration)] : []),
     ...streams.flatMap((s) => ['-map', `0:${s.index}`]),
     '-c', 'copy',
+    ...(dropVideoBefore != null && dropVideoBefore > 0 ? ['-bsf:v', `noise=drop=lt(pts*tb\\,${fmt(dropVideoBefore)})`] : []),
     // (B-frame video starts with a negative decode timestamp: then shift all streams alike. make_zero would also remove
     // the offset of audio that starts a bit after `from`)
     '-avoid_negative_ts', 'make_non_negative',
@@ -237,7 +242,7 @@ function getAccurateCopyArgs({ inputPath, streams, from, duration, format, outPa
   ];
 }
 
-// pts (file's own timestamps) of the last keyframe at or before `at` (file's own timestamps), undefined if there is none
+// The last keyframe at or before `at` (file's own timestamps), undefined if there is none
 async function findKeyframeAtOrBefore(runner: FfRunner, { path, streamIndex, at, frameDuration }: { path: string, streamIndex: number, at: number, frameDuration: number }) {
   const tol = frameDuration / 4;
   for (const window of [15, 60, 300, Infinity]) {
@@ -251,7 +256,7 @@ async function findKeyframeAtOrBefore(runner: FfRunner, { path, streamIndex, at,
       '-of', 'json', path,
     ]);
     const keyframes = parsePackets(stdout).filter((p) => p.keyframe && p.pts <= at + tol);
-    if (keyframes.length > 0) return Math.max(...keyframes.map((p) => p.pts));
+    if (keyframes.length > 0) return keyframes.reduce((a, b) => (b.pts > a.pts ? b : a));
     if (from === 0) break;
   }
   return undefined;
@@ -406,18 +411,27 @@ export async function exportClips({ runner: rawRunner, request, onProgress, sign
     warnings.push(...problems.map((p) => `${label}: ${p}`));
   };
 
-  // Stream copy of one clip into `outPath`. With video: from the keyframe at or before the clip start (ffmpeg's own
-  // -ss seeking with stream copy can land on the keyframe *after* it, e.g. in MPEG-TS, so the keyframe is looked up first).
-  // Without video: from the clip start, with an accurate seek.
+  // Stream copy of one clip into `outPath`. With video: from the keyframe at or before the clip start. (ffmpeg's own -ss
+  // seeking with stream copy can land on the keyframe *after* it, so the keyframe is looked up first, and the copy starts
+  // at its decode timestamp.) Without video: from the clip start, with an accurate seek.
   const copyClip = async (clip: ExportClip, outPath: string) => {
-    let from = clip.start;
+    let from: number | null = clip.start;
+    let dropVideoBefore: number | undefined;
     if (video != null) {
+      const tol = (frameDuration ?? 0.04) / 4;
       const { startTime } = await probeStartTime(runner, input.path);
       const keyframe = await findKeyframeAtOrBefore(runner, { path: input.path, streamIndex: video.index, at: clip.start + startTime, frameDuration: frameDuration ?? 0.04 });
-      from = keyframe != null ? Math.max(0, keyframe - startTime) : 0;
+      const keyFrom = keyframe != null ? Math.min(keyframe.dts, keyframe.pts) - startTime - tol : 0;
+      if (keyframe != null && keyFrom > 0) {
+        from = keyFrom;
+        dropVideoBefore = keyframe.pts - startTime - keyFrom - tol;
+      } else {
+        // the first keyframe of the file (its dts can be negative, which an output seek would drop)
+        from = null;
+      }
     }
-    const duration = isToEnd(clip) ? undefined : clip.end - from;
-    await runner.ffmpeg(getAccurateCopyArgs({ inputPath: input.path, streams: allStreams, from, duration, format, outPath }));
+    const duration = isToEnd(clip) ? undefined : clip.end - (from ?? 0);
+    await runner.ffmpeg(getAccurateCopyArgs({ inputPath: input.path, streams: allStreams, from, duration, format, outPath, dropVideoBefore }));
   };
 
   try {

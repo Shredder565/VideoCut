@@ -390,8 +390,14 @@ async function standardChecks(src: Prepared, name: string, cuts: Cut[], containe
   const sumFrames = keyStats.reduce((a, st) => a + st.frames, 0);
   const sumDuration = keyStats.reduce((a, st) => a + st.duration, 0);
   const { stderr: decodeErr } = await execFileAsync(ffmpegPath, ['-hide_banner', '-nostdin', '-v', 'error', '-i', mergedKey.outputPaths[0]!, '-f', 'null', '-'], { maxBuffer, encoding: 'utf8' });
-  const fatal = decodeErr.split(/\r?\n/).filter((l) => /invalid|corrupt|error while decoding/i.test(l) && !/mmco/.test(l));
-  check(Math.abs(out.numbers.length - sumFrames) <= cuts.length && Math.abs(duration - sumDuration) < 0.25 && out.numbers.length > 0,
+  // decoder messages (the null muxer's complaints about its own rounded timestamps don't count; the file's dts are checked below)
+  const fatal = decodeErr.split(/\r?\n/).filter((l) => /invalid|corrupt|error while decoding/i.test(l) && !/mmco|\[null @/.test(l));
+  const { packets } = await ffprobeJson(['-select_streams', 'v:0', '-show_entries', 'packet=dts_time', mergedKey.outputPaths[0]!]);
+  // (Matroska stores no dts; ffprobe shows N/A for some packets)
+  const dts = (packets as { dts_time: string }[]).map((p) => Number(p.dts_time)).filter((t) => Number.isFinite(t));
+  const backwards = dts.findIndex((t, i) => i > 0 && !(t > dts[i - 1]!));
+  if (backwards !== -1) fatal.push(`video dts not increasing at packet ${backwards}`);
+  check(Math.abs(out.numbers.length - sumFrames) <= cuts.length && Math.abs(duration - sumDuration) < 0.25 && out.numbers.length > 0 && fatal.length === 0,
     `${name} merged keyframe: ${out.numbers.length} frames (clips: ${sumFrames}), ${duration.toFixed(3)}s (clips: ${sumDuration.toFixed(3)}s)${fatal.length > 0 ? `, ${fatal.length} decoder message(s): ${fatal[0]}` : ''}`);
   return { clips, parts };
 }
